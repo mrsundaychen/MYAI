@@ -6,13 +6,11 @@ import os
 import subprocess
 import threading
 import uuid
-from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
-from git_workspace import GitWorkspace
 from usage import QuotaExceededError, UsageCallbackHandler, UsageTracker
 from trace import AgentTraceHandler
 
@@ -132,7 +130,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--user",
         default=os.getenv("AGENT_USER", "default"),
-        help="用户标识：token 配额 + 独立 git 分支/worktree（默认 default）",
+        help="用户标识，用于 token 配额统计（默认 default）",
     )
     parser.add_argument(
         "--quota",
@@ -199,7 +197,7 @@ def _git_pr(root: str, title: str) -> str | None:
             return None
         subprocess.run(["git", "push", "-u", "origin", branch], cwd=root, check=True, capture_output=True, text=True)
         r = subprocess.run(
-            ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title],
+            ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", "由 coding agent 提交"],
             cwd=root, capture_output=True, text=True,
         )
         if r.returncode != 0:
@@ -211,17 +209,14 @@ def _git_pr(root: str, title: str) -> str | None:
         return None
 
 
-def _get_workspace(project_root: str | None, user: str) -> str:
-    """给每个用户一个 git 分支 + worktree；非 git 仓库则退回普通目录。"""
-    root = Path(project_root or os.getcwd()).resolve()
-    in_git = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
-        capture_output=True, text=True,
-    ).stdout.strip() == "true"
-    if not in_git:
-        return str(root)
-    ws = GitWorkspace(repo_dir=root, workspaces_dir=root / ".workspaces")
-    return str(ws.ensure(user))
+def _git_push(root: str) -> bool:
+    """推送当前分支到 origin。"""
+    try:
+        subprocess.run(["git", "push"], cwd=root, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"[push 失败] {exc.stderr.strip()}")
+        return False
 
 
 def main() -> None:
@@ -240,28 +235,27 @@ def main() -> None:
         else "pipeline" if args.pipeline
         else "agent"
     )
-    current_user = args.user
-    # 每个用户一个分支 + worktree，agent 在该 worktree 里操作
-    workspace = _get_workspace(args.project_root, current_user)
+    # 单用户模式：agent 直接工作在项目根目录（main 分支）
+    workspace = args.project_root or os.getcwd()
     try:
         agent = build_by_mode(mode, workspace)
     except RuntimeError as exc:
         print(f"错误：{exc}")
         raise SystemExit(1)
 
-    tracker = UsageTracker(user=current_user, quota=args.quota)
+    tracker = UsageTracker(user=args.user, quota=args.quota)
     handler = UsageCallbackHandler(tracker)
 
     trace_enabled = True
     tools_logging = True
 
     config = {
-        "configurable": {"thread_id": f"cli-{current_user}"},
+        "configurable": {"thread_id": f"cli-{tracker.user}"},
         "recursion_limit": 100,
         "callbacks": [handler],
     }
 
-    print("Coding Agent 已启动（exit /usage /mode /user /trace /clear /repomap /tools /commit /pr）")
+    print("Coding Agent 已启动（exit /usage /mode /trace /clear /repomap /tools /commit /push /pr）")
     print(f"当前模式：{mode}  详细日志：{'开' if trace_enabled else '关'}")
     print(f"工作目录：{workspace}")
     print(tracker.summary())
@@ -330,23 +324,10 @@ def main() -> None:
                 print(f"PR 已创建: {url}")
             continue
 
-        # /user <name>：切换用户（新分支/worktree + 新会话 + 新配额）
-        tokens = user_input.split()
-        if tokens and tokens[0].lower() in ("user", "/user"):
-            if len(tokens) == 1:
-                print(f"当前用户：{current_user}，用法：/user <名字>")
-                continue
-            current_user = tokens[1]
-            workspace = _get_workspace(args.project_root, current_user)
-            try:
-                agent = build_by_mode(mode, workspace)
-            except RuntimeError as exc:
-                print(f"切换失败：{exc}")
-                continue
-            tracker = UsageTracker(user=current_user, quota=args.quota)
-            handler = UsageCallbackHandler(tracker)
-            config["configurable"]["thread_id"] = f"cli-{current_user}"
-            print(f"已切换到用户 {current_user}（工作目录 {workspace}）。")
+        # /push：推送当前分支到 origin
+        if cmd.lower() in ("push", "/push"):
+            if _git_push(workspace):
+                print("已推送。")
             continue
 
         # 运行时切换模式：/mode 或 /mode <name>

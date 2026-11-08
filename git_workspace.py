@@ -90,7 +90,7 @@ class GitWorkspace:
             check=True,
         )
 
-    def create_pr(self, thread_id: str, title: str) -> str:
+    def create_pr(self, thread_id: str, title: str, body: str = "") -> str:
         """push 并创建 PR，返回 PR url。"""
         self.push(thread_id)
         r = self._run(
@@ -99,6 +99,7 @@ class GitWorkspace:
                 "--base", "main",
                 "--head", self.branch_name(thread_id),
                 "--title", title,
+                "--body", body or "由 coding agent 提交",
             ],
             cwd=self.ws_root / thread_id,
         )
