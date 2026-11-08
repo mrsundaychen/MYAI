@@ -12,7 +12,10 @@ from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
-from langchain.agents.middleware.summarization import DEFAULT_SUMMARY_PROMPT
+from langchain.agents.middleware.summarization import (
+    DEFAULT_SUMMARY_PROMPT,
+    count_tokens_approximately,
+)
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import (
     AIMessage,
@@ -20,6 +23,7 @@ from langchain_core.messages import (
     HumanMessage,
     RemoveMessage,
     SystemMessage,
+    ToolMessage,
     get_buffer_string,
 )
 from langchain_core.tools import tool
@@ -183,17 +187,40 @@ def _build_review_agent(model, backend):
 
 
 # 外层图的上下文压缩：messages 太长时，把老的部分压成摘要，保留最近 COMPACT_KEEP 条
-COMPACT_KEEP = 20
-COMPACT_TRIGGER = 8000  # 粗略 token 阈值（1 字符 ≈ 1 token 量级）
+COMPACT_KEEP = 10
+COMPACT_TRIGGER = 4000  # token 阈值（用 count_tokens_approximately 估算）
 
 
 def _estimate_tokens(messages):
-    """粗略估算 token 数。"""
-    return sum(len(str(m.content)) for m in messages)
+    """估算 token 数（4 字符 ≈ 1 token + 每条消息固定开销，比按字符数准）。"""
+    return count_tokens_approximately(messages)
+
+
+# 文件类工具：其结果可重新读取，压缩时只留占位符、不保留内容
+FILE_TOOLS = {"read_file", "grep", "glob", "ls"}
+
+
+def _strip_file_contents(messages):
+    """把文件类工具结果替换成占位符（内容可重新读取，不长期留在历史里）。"""
+    out = []
+    for m in messages:
+        if isinstance(m, ToolMessage) and m.name in FILE_TOOLS:
+            out.append(ToolMessage(
+                content=f"[工具 {m.name} 的内容已省略，可重新调用读取]",
+                tool_call_id=m.tool_call_id,
+                name=m.name,
+            ))
+        else:
+            out.append(m)
+    return out
 
 
 def _compact_node(model):
-    """返回一个 compact 节点：超阈值时把老消息压成摘要，并从 state 移除老消息。"""
+    """返回一个 compact 节点：超阈值时把老消息压成摘要，并从 state 移除老消息。
+
+    - 文件类工具结果先「去内容化」（可重新读取，不占 token）
+    - 结构信息由 repo_map 工具按需获取，不在这里重复注入
+    """
 
     def compact(state):
         messages = state["messages"]
@@ -203,6 +230,7 @@ def _compact_node(model):
         recent = messages[-COMPACT_KEEP:]
         if not old:
             return {}
+        old = _strip_file_contents(old)
         prompt = DEFAULT_SUMMARY_PROMPT.format(messages=get_buffer_string(old))
         summary = model.invoke([HumanMessage(content=prompt)])
         text = summary.content if isinstance(summary.content, str) else str(summary.content)
@@ -216,6 +244,70 @@ def _compact_node(model):
 
     compact.__name__ = "compact"
     return compact
+
+
+class _CompactMiddleware(AgentMiddleware[Any, Any, Any]):
+    """自定义上下文压缩中间件：逻辑与 _compact_node 一致，供 agent 模式用。
+
+    name 设为 "SummarizationMiddleware"，以替换 deepagents 默认的 summarization 中间件。
+    用 before_model 钩子回写 state，让压缩持久化（否则 state 不缩、每轮都重新压缩）。
+    """
+
+    @property
+    def name(self) -> str:
+        return "SummarizationMiddleware"
+
+    def __init__(self, model, trigger=COMPACT_TRIGGER, keep=COMPACT_KEEP):
+        self._model = model
+        self._trigger = trigger
+        self._keep = keep
+
+    def _compact(self, messages):
+        """返回 state 更新（压缩后）或 None（无需压缩）。"""
+        tokens = count_tokens_approximately(messages)
+        rounds = sum(1 for m in messages if isinstance(m, HumanMessage))
+        # 调试输出：观察压缩触发情况，后续可移除
+        print(f"[compact] tokens={tokens} / {self._trigger}, rounds={rounds}, triggered={tokens > self._trigger}")
+        if tokens <= self._trigger:
+            return None
+        old, recent = messages[:-self._keep], messages[-self._keep:]
+        if not old:
+            return None
+        old = _strip_file_contents(old)
+        prompt = DEFAULT_SUMMARY_PROMPT.format(messages=get_buffer_string(old))
+        summary = self._model.invoke([HumanMessage(content=prompt)])
+        text = summary.content if isinstance(summary.content, str) else str(summary.content)
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                HumanMessage(content=f"[更早对话摘要]\n{text}"),
+                *recent,
+            ]
+        }
+
+    async def _acompact(self, messages):
+        if count_tokens_approximately(messages) <= self._trigger:
+            return None
+        old, recent = messages[:-self._keep], messages[-self._keep:]
+        if not old:
+            return None
+        old = _strip_file_contents(old)
+        prompt = DEFAULT_SUMMARY_PROMPT.format(messages=get_buffer_string(old))
+        summary = await self._model.ainvoke([HumanMessage(content=prompt)])
+        text = summary.content if isinstance(summary.content, str) else str(summary.content)
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                HumanMessage(content=f"[更早对话摘要]\n{text}"),
+                *recent,
+            ]
+        }
+
+    def before_model(self, state, runtime):
+        return self._compact(state["messages"])
+
+    async def abefore_model(self, state, runtime):
+        return await self._acompact(state["messages"])
 
 def build_model() -> ChatOpenAI:
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -269,8 +361,9 @@ def build_agent(project_root: str | Path | None = None, checkpointer=None):
 
     backend = LocalShellBackend(root_dir=root, virtual_mode=True)
 
+    model = build_model()
     return create_deep_agent(
-        model=build_model(),
+        model=model,
         system_prompt=MAIN_PROMPT,
         backend=backend,
         # 主 agent 只做意图识别和委派：隐藏所有文件/命令工具，只留 task；模型调用加重试。
@@ -278,6 +371,8 @@ def build_agent(project_root: str | Path | None = None, checkpointer=None):
             _ToolExclusionMiddleware(excluded=MAIN_EXCLUDED_TOOLS),
             _retry_model_middleware(),
             _tool_list_middleware(),
+            # 自定义上下文压缩（逻辑与 _compact_node 一致），替换 deepagents 默认 summarization
+            _CompactMiddleware(model=model),
         ],
         subagents=[
             {
