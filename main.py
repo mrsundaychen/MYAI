@@ -19,6 +19,8 @@ USAGE_COMMANDS = {"usage", "/usage"}
 MODE_NAMES = ("agent", "pipeline", "routed", "dynamic")
 
 
+
+
 def message_text(message) -> str:
     """从 AIMessage 中提取可读文本。"""
     content = message.content
