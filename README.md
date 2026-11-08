@@ -111,3 +111,5 @@ git push -u origin main
 - DeepSeek 长输出（几千 token 的审查报告）偶发断连，重试可能不够，建议限制输出长度或换模型。
 - 文件系统隔离靠 git worktree；多用户并发改同一仓库时，冲突仍需手动解决。
 - 重度并发写 SQLite 有单写者瓶颈，需要换 Postgres checkpointer。
+
+<!-- PR test -->
