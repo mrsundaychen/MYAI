@@ -3,13 +3,16 @@
 import argparse
 import logging
 import os
+import subprocess
 import threading
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
+from git_workspace import GitWorkspace
 from usage import QuotaExceededError, UsageCallbackHandler, UsageTracker
 from trace import AgentTraceHandler
 
@@ -129,7 +132,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--user",
         default=os.getenv("AGENT_USER", "default"),
-        help="用户标识，用于 token 配额统计（默认 default）",
+        help="用户标识：token 配额 + 独立 git 分支/worktree（默认 default）",
     )
     parser.add_argument(
         "--quota",
@@ -171,6 +174,56 @@ def build_by_mode(mode: str, project_root, checkpointer=None):
     raise ValueError(f"未知模式：{mode}")
 
 
+def _git_commit(root: str, message: str) -> bool:
+    """在 root 目录 git add -A + commit；无改动返回 False。"""
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True, text=True)
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True)
+        if not r.stdout.strip():
+            return False
+        subprocess.run(["git", "commit", "-m", message], cwd=root, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"[commit 失败] {exc.stderr.strip()}")
+        return False
+
+
+def _git_pr(root: str, title: str) -> str | None:
+    """push 当前分支 + gh pr create，返回 PR url；失败返回 None。"""
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=root, capture_output=True, text=True
+        ).stdout.strip()
+        if not branch or branch == "main":
+            print("[pr] 请先切到一个 feature 分支（main 不能直接提 PR）")
+            return None
+        subprocess.run(["git", "push", "-u", "origin", branch], cwd=root, check=True, capture_output=True, text=True)
+        r = subprocess.run(
+            ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title],
+            cwd=root, capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f"[pr 失败] {r.stderr.strip()}")
+            return None
+        return r.stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        print(f"[pr 失败] {exc.stderr.strip()}")
+        return None
+
+
+def _get_workspace(project_root: str | None, user: str) -> str:
+    """给每个用户一个 git 分支 + worktree；非 git 仓库则退回普通目录。"""
+    root = Path(project_root or os.getcwd()).resolve()
+    in_git = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True,
+    ).stdout.strip() == "true"
+    if not in_git:
+        return str(root)
+    ws = GitWorkspace(repo_dir=root, workspaces_dir=root / ".workspaces")
+    return str(ws.ensure(user))
+
+
 def main() -> None:
     print(say_hello())
     load_dotenv()
@@ -187,27 +240,30 @@ def main() -> None:
         else "pipeline" if args.pipeline
         else "agent"
     )
+    current_user = args.user
+    # 每个用户一个分支 + worktree，agent 在该 worktree 里操作
+    workspace = _get_workspace(args.project_root, current_user)
     try:
-        agent = build_by_mode(mode, args.project_root)
+        agent = build_by_mode(mode, workspace)
     except RuntimeError as exc:
         print(f"错误：{exc}")
         raise SystemExit(1)
 
-    tracker = UsageTracker(user=args.user, quota=args.quota)
+    tracker = UsageTracker(user=current_user, quota=args.quota)
     handler = UsageCallbackHandler(tracker)
 
     trace_enabled = True
     tools_logging = True
 
     config = {
-        "configurable": {"thread_id": f"cli-1"},
+        "configurable": {"thread_id": f"cli-{current_user}"},
         "recursion_limit": 100,
         "callbacks": [handler],
     }
 
-    print("Coding Agent 已启动（exit 退出 /usage 用量 /mode 模式 /trace 日志 /clear 清空 /repomap 地图 /tools 工具）")
+    print("Coding Agent 已启动（exit /usage /mode /user /trace /clear /repomap /tools /commit /pr）")
     print(f"当前模式：{mode}  详细日志：{'开' if trace_enabled else '关'}")
-    print(f"工作目录：{args.project_root or '.'}")
+    print(f"工作目录：{workspace}")
     print(tracker.summary())
 
     while True:
@@ -229,7 +285,7 @@ def main() -> None:
         if user_input.lower() in ("repomap", "/repomap"):
             from repo_map import build_repo_map
 
-            print(build_repo_map(args.project_root or os.getcwd()))
+            print(build_repo_map(workspace))
             continue
 
         if user_input.lower() in ("clear", "/clear"):
@@ -254,6 +310,45 @@ def main() -> None:
             print(f"工具列表打印已{'开启' if tools_logging else '关闭'}（每次模型调用前打印可见工具）")
             continue
 
+        # /commit [message]：提交改动
+        cmd, _, arg = user_input.partition(" ")
+        if cmd.lower() in ("commit", "/commit"):
+            message = arg.strip() or "coding agent changes"
+            root = workspace
+            if _git_commit(root, message):
+                print("已提交改动。")
+            else:
+                print("没有可提交的改动。")
+            continue
+
+        # /pr [title]：push 当前分支 + 提 PR
+        if cmd.lower() in ("pr", "/pr"):
+            title = arg.strip() or "coding agent changes"
+            root = workspace
+            url = _git_pr(root, title)
+            if url:
+                print(f"PR 已创建: {url}")
+            continue
+
+        # /user <name>：切换用户（新分支/worktree + 新会话 + 新配额）
+        tokens = user_input.split()
+        if tokens and tokens[0].lower() in ("user", "/user"):
+            if len(tokens) == 1:
+                print(f"当前用户：{current_user}，用法：/user <名字>")
+                continue
+            current_user = tokens[1]
+            workspace = _get_workspace(args.project_root, current_user)
+            try:
+                agent = build_by_mode(mode, workspace)
+            except RuntimeError as exc:
+                print(f"切换失败：{exc}")
+                continue
+            tracker = UsageTracker(user=current_user, quota=args.quota)
+            handler = UsageCallbackHandler(tracker)
+            config["configurable"]["thread_id"] = f"cli-{current_user}"
+            print(f"已切换到用户 {current_user}（工作目录 {workspace}）。")
+            continue
+
         # 运行时切换模式：/mode 或 /mode <name>
         tokens = user_input.split()
         if tokens and tokens[0].lower() in ("mode", "/mode"):
@@ -266,7 +361,7 @@ def main() -> None:
                 print(f"未知模式：{new_mode}，可选：{', '.join(MODE_NAMES)}")
                 continue
             try:
-                agent = build_by_mode(new_mode, args.project_root)
+                agent = build_by_mode(new_mode, workspace)
             except RuntimeError as exc:
                 print(f"切换失败：{exc}")
                 continue

@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 import uuid
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from dotenv import load_dotenv
@@ -34,9 +35,14 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from agent import make_async_checkpointer
+from git_workspace import GitWorkspace
 from main import build_by_mode
 
 load_dotenv()
+
+# 每个用户一个 git 分支 + worktree（文件系统隔离 + PR 提交）
+REPO_DIR = Path(__file__).resolve().parent
+git_ws = GitWorkspace(repo_dir=REPO_DIR, workspaces_dir=REPO_DIR / ".workspaces")
 
 
 class ChatRequest(BaseModel):
@@ -45,14 +51,19 @@ class ChatRequest(BaseModel):
     thread_id: str | None = None   # None = 自动生成新会话 id
 
 
+class PrRequest(BaseModel):
+    thread_id: str
+    title: str
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
     # 关停时关闭 aiosqlite 连接，避免 loop 关闭后 worker 线程报错
-    for conn in _conns.values():
+    for cp in _checkpointers.values():
         with contextlib.suppress(Exception):
-            await conn.close()
-    _conns.clear()
+            await cp.conn.close()
+    _checkpointers.clear()
     _agents.clear()
 
 
@@ -64,19 +75,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 每个模式缓存一个已编译的 agent（构建有开销），配异步 sqlite checkpointer。
-_agents: dict[str, Any] = {}
-_conns: dict[str, Any] = {}   # 记录 aiosqlite 连接，关停时清理
+# 每个模式共享一个 checkpointer（一个 aiosqlite 连接，指向同一个 sqlite 文件）。
+_checkpointers: dict[str, Any] = {}
+# 每个 (mode, thread_id) 一个 agent：backend 指向该用户的 worktree。
+_agents: dict[tuple[str, str], Any] = {}
 _lock = asyncio.Lock()
 
 
-async def get_agent(mode: str):
+async def get_user_agent(mode: str, thread_id: str):
+    key = (mode, thread_id)
+    if key in _agents:
+        return _agents[key]
     async with _lock:
-        if mode not in _agents:
-            saver = await make_async_checkpointer()
-            _agents[mode] = build_by_mode(mode, None, checkpointer=saver)
-            _conns[mode] = saver.conn
-        return _agents[mode]
+        if key in _agents:
+            return _agents[key]
+        if mode not in _checkpointers:
+            _checkpointers[mode] = await make_async_checkpointer()
+        # 该用户的 worktree（独立分支），agent 在它里面读写文件，互不干扰
+        workspace = await asyncio.to_thread(git_ws.ensure, thread_id)
+        _agents[key] = build_by_mode(mode, str(workspace), checkpointer=_checkpointers[mode])
+        return _agents[key]
 
 
 def _chunk_text(chunk) -> str:
@@ -177,8 +195,8 @@ async def _stream_agent(agent, message: str, thread_id: str) -> AsyncIterator[st
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    agent = await get_agent(req.mode)
     thread_id = req.thread_id or uuid.uuid4().hex   # 不传就开新会话
+    agent = await get_user_agent(req.mode, thread_id)
     return StreamingResponse(
         _stream_agent(agent, req.message, thread_id),
         media_type="text/event-stream",
@@ -187,6 +205,20 @@ async def chat_stream(req: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/pr")
+async def create_pr(req: PrRequest):
+    """把该用户分支的改动提交并提 PR；有冲突则报告给用户（不自动解）。"""
+    committed = await asyncio.to_thread(git_ws.commit, req.thread_id, req.title)
+    if not committed:
+        return {"status": "no_changes"}
+    conflicted = await asyncio.to_thread(git_ws.merge_main, req.thread_id)
+    if conflicted:
+        files = await asyncio.to_thread(git_ws.conflicted_files, req.thread_id)
+        return {"status": "conflict", "files": files, "message": "与 main 有冲突，请手动解决"}
+    url = await asyncio.to_thread(git_ws.create_pr, req.thread_id, req.title)
+    return {"status": "ok", "pr_url": url}
 
 
 @app.get("/health")

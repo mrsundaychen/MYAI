@@ -53,14 +53,17 @@ class GitWorkspace:
             return ws
 
         branch = self.branch_name(thread_id)
-        # 更新 base：有 remote 就 fetch origin/base；本地仓库就 checkout base
+        # 更新 base：有 remote 就尝试 fetch origin/base；失败（无网络/SSH 未配）退回本地 base
         has_remote = self._run(["git", "remote"]).stdout.strip() != ""
+        base_ref = base
         if has_remote:
-            self._run(["git", "fetch", "origin", base], check=True)
-            base_ref = f"origin/{base}"
+            r = self._run(["git", "fetch", "origin", base])
+            if r.returncode == 0:
+                base_ref = f"origin/{base}"
+            else:
+                self._run(["git", "checkout", base], check=True)
         else:
             self._run(["git", "checkout", base], check=True)
-            base_ref = base
 
         # 分支不存在就新建。用 git branch（不 checkout），避免占住主工作区
         if self._run(["git", "rev-parse", "--verify", branch]).returncode != 0:
