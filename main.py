@@ -19,11 +19,6 @@ USAGE_COMMANDS = {"usage", "/usage"}
 MODE_NAMES = ("agent", "pipeline", "routed", "dynamic")
 
 
-def say_hello() -> str:
-    """返回一句问候语。"""
-    return "Hello, World!"
-
-
 def message_text(message) -> str:
     """从 AIMessage 中提取可读文本。"""
     content = message.content
@@ -172,7 +167,6 @@ def build_by_mode(mode: str, project_root, checkpointer=None):
 
 
 def main() -> None:
-    print(say_hello())
     load_dotenv()
     args = parse_args()
 
