@@ -1,0 +1,8 @@
+.env
+.usage.json
+checkpoints.sqlite*
+.venv/
+.workspaces/
+__pycache__/
+*.pyc
+.idea/

@@ -1,0 +1,7 @@
+deepagents>=0.7
+langchain-openai>=1.6
+python-dotenv>=1.2
+fastapi
+uvicorn
+langgraph-checkpoint-sqlite
+aiosqlite
